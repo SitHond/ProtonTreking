@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -28,6 +29,24 @@ STEAM_ROOT_CANDIDATES = [
 ]
 
 LOG_PATH = Path("/tmp/protontrek.log")
+
+LAUNCH_MODES: dict[str, tuple[str, str]] = {
+    "runinprefix_start": (
+        "Proton runinprefix start /unix",
+        "Мягкий запуск внутри префикса через start /unix",
+    ),
+    "runinprefix_direct": (
+        "Proton runinprefix",
+        "Прямой запуск через wine внутри того же префикса",
+    ),
+    "run": (
+        "Proton run",
+        "Обычный запуск через Proton run",
+    ),
+}
+
+DEFAULT_LAUNCH_MODE = "runinprefix_start"
+DEFAULT_DELAY_SECONDS = "0"
 
 
 @dataclass
@@ -393,17 +412,106 @@ def trainer_log_path(game: RunningGame) -> Path:
     return Path("/tmp") / f"protontrek-{safe_name}-{game.app.app_id}.log"
 
 
-def build_launch_command(proton_script: Path, trainer_path: Path) -> list[str]:
-    return [
-        str(proton_script),
-        "runinprefix",
-        "start",
-        "/unix",
-        str(trainer_path),
-    ]
+def parse_delay_seconds(value: str) -> int:
+    raw = value.strip() or DEFAULT_DELAY_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("Задержка должна быть целым числом секунд.") from exc
+    if seconds < 0 or seconds > 600:
+        raise RuntimeError("Задержка должна быть в диапазоне от 0 до 600 секунд.")
+    return seconds
 
 
-def launch_trainer(game: RunningGame, trainer_path: Path) -> tuple[subprocess.Popen[bytes], Path]:
+def launch_mode_label(mode: str) -> str:
+    return LAUNCH_MODES.get(mode, (mode, ""))[0]
+
+
+def mode_key_from_label(label: str) -> str | None:
+    for key, (mode_label, _description) in LAUNCH_MODES.items():
+        if mode_label == label:
+            return key
+    return None
+
+
+def build_launch_command(proton_script: Path, trainer_path: Path, mode: str) -> list[str]:
+    if mode == "runinprefix_start":
+        return [
+            str(proton_script),
+            "runinprefix",
+            "start",
+            "/unix",
+            str(trainer_path),
+        ]
+    if mode == "runinprefix_direct":
+        return [
+            str(proton_script),
+            "runinprefix",
+            str(trainer_path),
+        ]
+    if mode == "run":
+        return [
+            str(proton_script),
+            "run",
+            str(trainer_path),
+        ]
+    raise RuntimeError(f"Неизвестный режим запуска: {mode}")
+
+
+def spawn_launch_process(
+    launch_cmd: list[str],
+    env: dict[str, str],
+    cwd: Path,
+    log_path: Path,
+    delay_seconds: int,
+) -> subprocess.Popen[bytes]:
+    log_handle = log_path.open("ab")
+    try:
+        if delay_seconds <= 0:
+            process = subprocess.Popen(
+                launch_cmd,
+                env=env,
+                cwd=str(cwd),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        else:
+            delay_cmd = [
+                sys.executable,
+                "-c",
+                (
+                    "import os, subprocess, sys, time; "
+                    "time.sleep(int(sys.argv[1])); "
+                    "cmd=sys.argv[2:]; "
+                    "subprocess.Popen(cmd, env=os.environ.copy(), cwd=os.getcwd(), "
+                    "stdout=open(os.environ['PROTONTREK_LOG_PATH'], 'ab'), "
+                    "stderr=subprocess.STDOUT, start_new_session=True)"
+                ),
+                str(delay_seconds),
+                *launch_cmd,
+            ]
+            delay_env = env.copy()
+            delay_env["PROTONTREK_LOG_PATH"] = str(log_path)
+            process = subprocess.Popen(
+                delay_cmd,
+                env=delay_env,
+                cwd=str(cwd),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    finally:
+        log_handle.close()
+    return process
+
+
+def launch_trainer(
+    game: RunningGame,
+    trainer_path: Path,
+    mode: str,
+    delay_seconds: int,
+) -> tuple[subprocess.Popen[bytes], Path]:
     proton_dir = game.proton_path
     if not proton_dir:
         raise RuntimeError("Не удалось определить путь к Proton для этой игры.")
@@ -414,32 +522,30 @@ def launch_trainer(game: RunningGame, trainer_path: Path) -> tuple[subprocess.Po
 
     env = build_launch_env(game, trainer_path)
     log_path = trainer_log_path(game)
-    launch_cmd = build_launch_command(proton_script, trainer_path)
+    launch_cmd = build_launch_command(proton_script, trainer_path, mode)
     log_debug(f"launch trainer pid_target={game.pid} cmd={launch_cmd!r}")
-    log_debug(f"launch env appid={game.app.app_id} proton={proton_dir} prefix={game.app.prefix_dir}")
+    log_debug(
+        f"launch env appid={game.app.app_id} proton={proton_dir} prefix={game.app.prefix_dir} "
+        f"mode={mode} delay={delay_seconds}"
+    )
 
-    log_handle = log_path.open("ab")
-    log_handle.write(
-        (
-            f"\n=== ProtonTrek launch ===\n"
-            f"game={game.app.name}\n"
-            f"appid={game.app.app_id}\n"
-            f"game_pid={game.pid}\n"
-            f"trainer={trainer_path}\n"
-            f"proton={proton_dir}\n"
-            f"prefix={game.app.prefix_dir}\n"
-            f"cwd={trainer_path.parent}\n"
-        ).encode("utf-8", errors="ignore")
-    )
-    process = subprocess.Popen(
-        launch_cmd,
-        env=env,
-        cwd=str(trainer_path.parent),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    log_handle.close()
+    with log_path.open("ab") as log_handle:
+        log_handle.write(
+            (
+                f"\n=== ProtonTrek launch ===\n"
+                f"ts={int(time.time())}\n"
+                f"game={game.app.name}\n"
+                f"appid={game.app.app_id}\n"
+                f"game_pid={game.pid}\n"
+                f"trainer={trainer_path}\n"
+                f"proton={proton_dir}\n"
+                f"prefix={game.app.prefix_dir}\n"
+                f"cwd={trainer_path.parent}\n"
+                f"mode={mode}\n"
+                f"delay_seconds={delay_seconds}\n"
+            ).encode("utf-8", errors="ignore")
+        )
+    process = spawn_launch_process(launch_cmd, env, trainer_path.parent, log_path, delay_seconds)
     return process, log_path
 
 
@@ -453,6 +559,8 @@ class TrainerLauncherApp:
         self.steam_root = discover_steam_root()
         self.games: list[RunningGame] = []
         self.selected_trainer = tk.StringVar()
+        self.selected_mode = tk.StringVar(value=DEFAULT_LAUNCH_MODE)
+        self.delay_seconds = tk.StringVar(value=DEFAULT_DELAY_SECONDS)
         self.status_text = tk.StringVar(value="Поиск Steam...")
 
         self._build_ui()
@@ -510,17 +618,31 @@ class TrainerLauncherApp:
         trainer_entry = ttk.Entry(right, textvariable=self.selected_trainer)
         trainer_entry.grid(row=3, column=1, sticky="ew", pady=(0, 8))
 
+        ttk.Label(right, text="Режим запуска").grid(row=4, column=0, sticky="w")
+        mode_values = [label for label, _desc in LAUNCH_MODES.values()]
+        self.mode_combo = ttk.Combobox(
+            right,
+            state="readonly",
+            values=mode_values,
+        )
+        self.mode_combo.grid(row=4, column=1, sticky="ew", pady=(0, 8))
+        self.mode_combo.set(launch_mode_label(DEFAULT_LAUNCH_MODE))
+
+        ttk.Label(right, text="Задержка, сек").grid(row=5, column=0, sticky="w")
+        delay_entry = ttk.Entry(right, textvariable=self.delay_seconds)
+        delay_entry.grid(row=5, column=1, sticky="ew", pady=(0, 8))
+
         buttons = ttk.Frame(right)
-        buttons.grid(row=4, column=1, sticky="w", pady=(0, 8))
+        buttons.grid(row=6, column=1, sticky="w", pady=(0, 8))
         ttk.Button(buttons, text="Выбрать trainer.exe", command=self.pick_trainer).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Запустить в префиксе", command=self.run_trainer).pack(side=tk.LEFT, padx=(8, 0))
 
         help_text = (
             "Утилита ищет процессы Steam/Proton через /proc, определяет appid, "
-            "compatdata-префикс и пытается использовать тот же Proton."
+            "compatdata-префикс и даёт выбрать режим запуска и задержку перед стартом trainer.exe."
         )
         ttk.Label(right, text=help_text, wraplength=420, justify=tk.LEFT).grid(
-            row=5,
+            row=7,
             column=0,
             columnspan=2,
             sticky="w",
@@ -609,15 +731,29 @@ class TrainerLauncherApp:
             messagebox.showerror("Файл не найден", f"Не найден файл:\n{trainer_path}")
             return
 
+        mode = mode_key_from_label(self.mode_combo.get())
+        if not mode:
+            messagebox.showerror("Нет режима", "Выберите корректный режим запуска.")
+            return
+
         try:
-            _process, log_path = launch_trainer(game, trainer_path)
+            delay_seconds = parse_delay_seconds(self.delay_seconds.get())
+        except RuntimeError as exc:
+            messagebox.showerror("Некорректная задержка", str(exc))
+            return
+
+        try:
+            _process, log_path = launch_trainer(game, trainer_path, mode, delay_seconds)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Ошибка запуска", str(exc))
             return
 
+        start_text = "сразу" if delay_seconds == 0 else f"через {delay_seconds} сек"
         messagebox.showinfo(
             "Запущено",
-            f"Trainer запущен через Proton для игры:\n{game.app.name}\n\nЛог:\n{log_path}",
+            f"Trainer будет запущен для игры:\n{game.app.name}\n"
+            f"Режим: {launch_mode_label(mode)}\n"
+            f"Старт: {start_text}\n\nЛог:\n{log_path}",
         )
 
 
@@ -712,14 +848,76 @@ def zenity_pick_trainer() -> Path | None:
     return Path(value).expanduser()
 
 
-def zenity_confirm_launch(game: RunningGame, trainer_path: Path) -> bool:
+def zenity_pick_launch_options() -> tuple[str, int] | None:
+    mode_rows: list[str] = []
+    for key, (label, description) in LAUNCH_MODES.items():
+        mode_rows.extend([key, label, description])
+
+    mode_result = run_zenity(
+        [
+            "--list",
+            "--radiolist",
+            "--title=Режим запуска",
+            "--width=900",
+            "--height=320",
+            "--text=Выберите режим запуска trainer.exe",
+            "--column=Выбор",
+            "--column=Ключ",
+            "--column=Режим",
+            "--column=Описание",
+            "TRUE",
+            DEFAULT_LAUNCH_MODE,
+            launch_mode_label(DEFAULT_LAUNCH_MODE),
+            LAUNCH_MODES[DEFAULT_LAUNCH_MODE][1],
+            "FALSE",
+            "runinprefix_direct",
+            launch_mode_label("runinprefix_direct"),
+            LAUNCH_MODES["runinprefix_direct"][1],
+            "FALSE",
+            "run",
+            launch_mode_label("run"),
+            LAUNCH_MODES["run"][1],
+        ]
+    )
+    if mode_result.returncode != 0:
+        return None
+
+    mode = mode_result.stdout.strip()
+    if mode not in LAUNCH_MODES:
+        return None
+
+    delay_result = run_zenity(
+        [
+            "--entry",
+            "--title=Задержка запуска",
+            "--width=420",
+            "--text=Введите задержку перед стартом trainer.exe в секундах (0-600)",
+            f"--entry-text={DEFAULT_DELAY_SECONDS}",
+        ]
+    )
+    if delay_result.returncode != 0:
+        return None
+
+    try:
+        delay_seconds = parse_delay_seconds(delay_result.stdout.strip())
+    except RuntimeError as exc:
+        zenity_error(str(exc))
+        return None
+
+    return mode, delay_seconds
+
+
+def zenity_confirm_launch(game: RunningGame, trainer_path: Path, mode: str, delay_seconds: int) -> bool:
     proton_text = str(game.proton_path) if game.proton_path else "Не определён"
+    start_text = "сразу" if delay_seconds == 0 else f"через {delay_seconds} сек"
     text = (
         f"Игра: {game.app.name}\n"
         f"AppID: {game.app.app_id}\n"
         f"PID: {game.pid}\n"
         f"Префикс: {game.app.prefix_dir}\n"
         f"Proton: {proton_text}\n"
+        f"Режим: {launch_mode_label(mode)}\n"
+        f"Старт: {start_text}\n"
         f"Trainer: {trainer_path}\n\n"
         "Запустить?"
     )
@@ -759,16 +957,28 @@ def run_zenity_flow() -> int:
         zenity_error(f"Не найден файл:\n{trainer_path}")
         return 1
 
-    if not zenity_confirm_launch(game, trainer_path):
+    launch_options = zenity_pick_launch_options()
+    if not launch_options:
+        zenity_info("Параметры запуска не выбраны. Запуск отменён.")
+        return 1
+
+    mode, delay_seconds = launch_options
+
+    if not zenity_confirm_launch(game, trainer_path, mode, delay_seconds):
         return 1
 
     try:
-        launch_trainer(game, trainer_path)
+        _process, log_path = launch_trainer(game, trainer_path, mode, delay_seconds)
     except Exception as exc:  # noqa: BLE001
         zenity_error(str(exc))
         return 1
 
-    zenity_info(f"Trainer запущен через Proton для игры:\n{game.app.name}")
+    start_text = "сразу" if delay_seconds == 0 else f"через {delay_seconds} сек"
+    zenity_info(
+        f"Trainer будет запущен для игры:\n{game.app.name}\n"
+        f"Режим: {launch_mode_label(mode)}\n"
+        f"Старт: {start_text}\n\nЛог:\n{log_path}"
+    )
     return 0
 
 
