@@ -6,6 +6,7 @@
 - определяет их `appid` и Proton-префикс из `steamapps/compatdata/<appid>`;
 - позволяет выбрать `trainer.exe`;
 - запускает этот `trainer.exe` в выбранном Proton-префиксе.
+- для запуска использует `proton runinprefix start /unix`, чтобы меньше конфликтовать с уже работающей игрой.
 
 ## Запуск
 
@@ -14,6 +15,8 @@ python3 steam_trainer_launcher.py
 ```
 
 Если в системе нет `tkinter`, скрипт автоматически переключится на графические диалоги через `zenity`.
+
+После запуска `trainer.exe` программа пишет лог в `/tmp/protontrek-<game>-<appid>.log`.
 
 ## Как это работает
 
@@ -30,6 +33,7 @@ python3 steam_trainer_launcher.py
 
 - Утилита рассчитана на Linux и локальную установку Steam.
 - Для GUI нужен либо `python3-tk`, либо установленный `zenity`.
+- Для разбора проблем запуска смотри `/tmp/protontrek.log` и `/tmp/protontrek-<game>-<appid>.log`.
 - Она лучше всего работает, когда игра уже запущена через Proton.
 - Некоторые игры могут не выставлять достаточно информации в `/proc`, тогда игра может не определиться.
 - Для запуска `trainer.exe` нужен доступный `proton` в установленном Steam.

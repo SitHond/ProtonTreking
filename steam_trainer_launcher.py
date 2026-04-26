@@ -47,6 +47,8 @@ class RunningGame:
     command: str
     proton_path: Path | None
     source: str
+    environ: dict[str, str]
+    cwd: Path | None
 
 
 SOURCE_PRIORITY = {
@@ -313,6 +315,8 @@ def find_running_games(steam_root: Path) -> list[RunningGame]:
             command=" ".join(shlex.quote(part) for part in cmdline),
             proton_path=detect_proton_path(environ, steam_root),
             source=detect_source(environ, cmdline),
+            environ=environ,
+            cwd=readlink_safe(Path("/proc") / str(pid) / "cwd"),
         )
         current = running_by_app.get(app_id)
         if current is None or is_better_game_candidate(game, current):
@@ -353,14 +357,53 @@ def detect_source(environ: dict[str, str], cmdline: list[str]) -> str:
     return "path"
 
 
-def build_launch_env(game: RunningGame) -> dict[str, str]:
-    env = os.environ.copy()
-    env["STEAM_COMPAT_DATA_PATH"] = str(game.app.prefix_dir)
-    env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(discover_steam_root() or game.app.library_root)
+def trainer_default_cwd(game: RunningGame) -> Path:
+    return game.cwd or game.app.install_dir or game.app.prefix_dir
+
+
+def sanitize_game_environment(game: RunningGame) -> dict[str, str]:
+    env = game.environ.copy()
+    env.setdefault("PATH", os.environ.get("PATH", ""))
+    env.setdefault("HOME", os.environ.get("HOME", str(Path.home())))
+    env.setdefault("USER", os.environ.get("USER", ""))
+    env.setdefault("DISPLAY", os.environ.get("DISPLAY", ""))
+    env.setdefault("XAUTHORITY", os.environ.get("XAUTHORITY", ""))
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS", os.environ.get("DBUS_SESSION_BUS_ADDRESS", ""))
+    env.setdefault("WAYLAND_DISPLAY", os.environ.get("WAYLAND_DISPLAY", ""))
+    env.setdefault("XDG_RUNTIME_DIR", os.environ.get("XDG_RUNTIME_DIR", ""))
+    env.setdefault("PWD", str(trainer_default_cwd(game)))
     return env
 
 
-def launch_trainer(game: RunningGame, trainer_path: Path) -> subprocess.Popen[bytes]:
+def build_launch_env(game: RunningGame, trainer_path: Path) -> dict[str, str]:
+    env = sanitize_game_environment(game)
+    steam_root = discover_steam_root() or game.app.library_root
+    env["STEAM_COMPAT_DATA_PATH"] = str(game.app.prefix_dir)
+    env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
+    env["STEAM_COMPAT_APP_ID"] = game.app.app_id
+    env["SteamAppId"] = game.app.app_id
+    env["SteamGameId"] = game.app.app_id
+    env["WINEPREFIX"] = str(game.app.prefix_dir / "pfx")
+    env["PWD"] = str(trainer_path.parent)
+    return env
+
+
+def trainer_log_path(game: RunningGame) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", game.app.name).strip("_") or game.app.app_id
+    return Path("/tmp") / f"protontrek-{safe_name}-{game.app.app_id}.log"
+
+
+def build_launch_command(proton_script: Path, trainer_path: Path) -> list[str]:
+    return [
+        str(proton_script),
+        "runinprefix",
+        "start",
+        "/unix",
+        str(trainer_path),
+    ]
+
+
+def launch_trainer(game: RunningGame, trainer_path: Path) -> tuple[subprocess.Popen[bytes], Path]:
     proton_dir = game.proton_path
     if not proton_dir:
         raise RuntimeError("Не удалось определить путь к Proton для этой игры.")
@@ -369,15 +412,35 @@ def launch_trainer(game: RunningGame, trainer_path: Path) -> subprocess.Popen[by
     if not proton_script.exists():
         raise RuntimeError(f"Файл Proton не найден: {proton_script}")
 
-    env = build_launch_env(game)
-    return subprocess.Popen(
-        [str(proton_script), "run", str(trainer_path)],
+    env = build_launch_env(game, trainer_path)
+    log_path = trainer_log_path(game)
+    launch_cmd = build_launch_command(proton_script, trainer_path)
+    log_debug(f"launch trainer pid_target={game.pid} cmd={launch_cmd!r}")
+    log_debug(f"launch env appid={game.app.app_id} proton={proton_dir} prefix={game.app.prefix_dir}")
+
+    log_handle = log_path.open("ab")
+    log_handle.write(
+        (
+            f"\n=== ProtonTrek launch ===\n"
+            f"game={game.app.name}\n"
+            f"appid={game.app.app_id}\n"
+            f"game_pid={game.pid}\n"
+            f"trainer={trainer_path}\n"
+            f"proton={proton_dir}\n"
+            f"prefix={game.app.prefix_dir}\n"
+            f"cwd={trainer_path.parent}\n"
+        ).encode("utf-8", errors="ignore")
+    )
+    process = subprocess.Popen(
+        launch_cmd,
         env=env,
         cwd=str(trainer_path.parent),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    log_handle.close()
+    return process, log_path
 
 
 class TrainerLauncherApp:
@@ -547,14 +610,14 @@ class TrainerLauncherApp:
             return
 
         try:
-            launch_trainer(game, trainer_path)
+            _process, log_path = launch_trainer(game, trainer_path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Ошибка запуска", str(exc))
             return
 
         messagebox.showinfo(
             "Запущено",
-            f"Trainer запущен через Proton для игры:\n{game.app.name}",
+            f"Trainer запущен через Proton для игры:\n{game.app.name}\n\nЛог:\n{log_path}",
         )
 
 
