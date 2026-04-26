@@ -1,4 +1,4 @@
-# ProtonTrek
+# ProtonTreking
 
 Небольшая GUI-утилита на Python для Linux:
 
